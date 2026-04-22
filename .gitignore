@@ -3,3 +3,5 @@
 layer
 __pycache__
 *temp*
+.csv
+.csv#
