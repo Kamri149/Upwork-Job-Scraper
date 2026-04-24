@@ -22,10 +22,7 @@ def _handle_signal(sig, _frame):
 
 
 def _scrape_cycle(token_mgr, proxy_mgr, max_pages):
-    proxy = proxy_mgr.get_proxy()
-    proxy_dict = proxy.to_curl_cffi_dict()
-
-    token = token_mgr.get_token(proxy_dict=proxy_dict)
+    token = token_mgr.get_token(proxy_mgr=proxy_mgr)
     jobs = fetch_all_jobs(token, proxy_mgr, max_pages=max_pages)
 
     if jobs:

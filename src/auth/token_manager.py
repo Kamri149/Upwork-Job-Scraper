@@ -42,7 +42,7 @@ class TokenManager:
         self._fetched_at: datetime | None = None
 
     def get_token(
-        self, proxy_dict: dict | None = None, force_refresh: bool = False
+        self, proxy_mgr=None, proxy_dict: dict | None = None, force_refresh: bool = False
     ) -> str:
         if not force_refresh and self._token and self._is_valid():
             return self._token
@@ -50,7 +50,8 @@ class TokenManager:
         last_err = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                self._token = _fetch_token(proxy_dict)
+                pd = proxy_mgr.get_proxy().to_curl_cffi_dict() if proxy_mgr else proxy_dict
+                self._token = _fetch_token(pd)
                 self._fetched_at = datetime.now()
                 return self._token
             except Exception as e:
