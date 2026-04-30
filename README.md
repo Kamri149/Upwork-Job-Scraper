@@ -51,7 +51,24 @@ src/
 
 ## Setup
 
-### 1. Get a Webshare proxy URL
+This scraper does not manage its own database. It connects to the shared PostgreSQL instance defined in [`../infra`](../infra).
+
+### 1. Start the shared database
+
+```bash
+cd ../infra
+docker compose up -d db
+```
+
+### 2. Run the migrations
+
+```bash
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper < resources/db/migrations/001_create_jobs_table.sql
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper < resources/db/migrations/002_add_last_seen.sql
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper < resources/db/migrations/003_rename_table.sql
+```
+
+### 3. Get a Webshare proxy URL
 
 Create an account at [webshare.io](https://webshare.io) and copy your proxy list download URL from the dashboard. It looks like:
 
@@ -61,7 +78,7 @@ https://proxy.webshare.io/api/v2/proxy/list/download/YOUR-TOKEN/
 
 The free tier (10 proxies) is enough to get started. If you see repeated 403 errors, the proxy IPs may be flagged by Cloudflare — upgrading to a paid plan with more IPs reduces this risk.
 
-### 2. Configure environment
+### 4. Configure environment
 
 ```bash
 cp .env.example .env
@@ -71,29 +88,14 @@ Edit `.env`:
 
 ```env
 POSTGRES_PASSWORD=your_password
-DATABASE_URL=postgresql://upwork:your_password@localhost:5432/upwork
+DATABASE_URL=postgresql://job_scraper:your_password@localhost:5432/job_scraper
 WEBSHARE_URL=https://proxy.webshare.io/api/v2/proxy/list/download/YOUR-TOKEN/
-```
-
-### 3. Start the database
-
-```bash
-docker compose up -d db
-```
-
-### 4. Run the migration
-
-Only needed once per migration. Run them in order:
-
-```bash
-docker compose exec -T db psql -U upwork -d upwork < resources/db/migrations/001_create_jobs_table.sql
-docker compose exec -T db psql -U upwork -d upwork < resources/db/migrations/002_add_last_seen.sql
 ```
 
 ### 5. Start the scraper
 
 ```bash
-docker compose up -d scraper
+docker compose up -d --build
 ```
 
 ## Common Commands
@@ -114,7 +116,7 @@ docker compose logs --tail=100 scraper
 # Check running containers
 docker ps
 
-# Check scraper and DB status
+# Check scraper status
 docker compose ps
 ```
 
@@ -122,53 +124,52 @@ docker compose ps
 
 ```bash
 # Connect to the database interactively
-docker compose exec db psql -U upwork -d upwork
+docker exec -it job-scraper-db psql -U job_scraper -d job_scraper
 
 # Count all scraped jobs
-docker compose exec db psql -U upwork -d upwork -c "SELECT COUNT(*) FROM jobs;"
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper -c "SELECT COUNT(*) FROM upwork_jobs;"
 
 # Jobs by type
-docker compose exec db psql -U upwork -d upwork -c "SELECT job_type, COUNT(*) FROM jobs GROUP BY job_type ORDER BY count DESC;"
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper -c "SELECT job_type, COUNT(*) FROM upwork_jobs GROUP BY job_type ORDER BY count DESC;"
 
 # Jobs by contractor tier
-docker compose exec db psql -U upwork -d upwork -c "SELECT contractor_tier, COUNT(*) FROM jobs GROUP BY contractor_tier ORDER BY count DESC;"
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper -c "SELECT contractor_tier, COUNT(*) FROM upwork_jobs GROUP BY contractor_tier ORDER BY count DESC;"
 
 # Most recently scraped jobs
-docker compose exec db psql -U upwork -d upwork -c "SELECT title, job_type, published_date FROM jobs ORDER BY scraped_at DESC LIMIT 20;"
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper -c "SELECT title, job_type, published_date FROM upwork_jobs ORDER BY scraped_at DESC LIMIT 20;"
 
 # Jobs scraped in the last 24 hours
-docker compose exec db psql -U upwork -d upwork -c "SELECT COUNT(*) FROM jobs WHERE scraped_at >= NOW() - INTERVAL '24 hours';"
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper -c "SELECT COUNT(*) FROM upwork_jobs WHERE scraped_at >= NOW() - INTERVAL '24 hours';"
 
 # Export all jobs to CSV
-docker compose exec db psql -U upwork -d upwork -c "\COPY (SELECT * FROM jobs) TO STDOUT WITH CSV HEADER" > jobs.csv
+docker exec -i job-scraper-db psql -U job_scraper -d job_scraper -c "\COPY (SELECT * FROM upwork_jobs) TO STDOUT WITH CSV HEADER" > upwork_jobs.csv
 ```
 
 ### Control
 
 ```bash
-# Stop everything (data is preserved in the pgdata volume)
+# Stop the scraper
 docker compose down
 
-# Stop and wipe the database volume (destructive — deletes all data)
-docker compose down -v
-
-# Restart just the scraper (e.g. after changing .env)
+# Restart the scraper (e.g. after changing .env)
 docker compose up -d
 
 # Rebuild the scraper image (e.g. after a code change) then restart
-docker compose build scraper && docker compose up -d scraper
+docker compose up -d --build scraper
 ```
 
-## Ports
+## Database
 
-The Postgres container is exposed on **host port 5432**. To connect from a local client (DBeaver, psql, TablePlus, etc.):
+Jobs are stored in the `upwork_jobs` table inside the shared `job_scraper` database. The database is managed by the [`infra`](../infra) repo.
+
+Connect from a local client (DBeaver, psql, TablePlus, etc.):
 
 ```
 Host:     localhost
 Port:     5432
-Database: upwork
-User:     upwork
-Password: <POSTGRES_PASSWORD from .env>
+Database: job_scraper
+User:     job_scraper
+Password: <POSTGRES_PASSWORD from infra/.env>
 ```
 
 ## Database Schema
@@ -197,10 +198,6 @@ Jobs are deduplicated on `cipher` (Upwork's unique job ID). The schema lives in 
 Indexes: `published_date DESC`, `scraped_at DESC`, `last_seen DESC`.
 
 `scraped_at` is set once on insert and never changes. `last_seen` is updated to `NOW()` every time the same job is seen again, so `last_seen - scraped_at` tells you how long a job has been on the market.
-
-## Data Persistence
-
-All data lives in a Docker named volume (`pgdata`). It survives `docker compose down`, container rebuilds, and host reboots. The only way to delete it is `docker compose down -v`.
 
 ## Proxies
 
