@@ -15,7 +15,7 @@ DB_FIELDS = [
 _columns = ", ".join(DB_FIELDS)
 _placeholders = ", ".join(f"%({f})s" for f in DB_FIELDS)
 INSERT_SQL = (
-    f"INSERT INTO jobs ({_columns}) VALUES ({_placeholders}) "
+    f"INSERT INTO upwork_jobs ({_columns}) VALUES ({_placeholders}) "
     "ON CONFLICT (cipher) DO UPDATE SET last_seen = NOW()"
 )
 
@@ -41,7 +41,7 @@ def has_jobs() -> bool:
     """Fast check for whether the jobs table has any rows."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT EXISTS(SELECT 1 FROM jobs)")
+            cur.execute("SELECT EXISTS(SELECT 1 FROM upwork_jobs)")
             return cur.fetchone()[0]
 
 
@@ -50,7 +50,7 @@ def get_job_count() -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT reltuples::bigint FROM pg_class WHERE relname = 'jobs'"
+                "SELECT reltuples::bigint FROM pg_class WHERE relname = 'upwork_jobs'"
             )
             row = cur.fetchone()
             return max(0, row[0]) if row else 0
