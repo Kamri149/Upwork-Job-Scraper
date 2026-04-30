@@ -16,7 +16,7 @@ _columns = ", ".join(DB_FIELDS)
 _placeholders = ", ".join(f"%({f})s" for f in DB_FIELDS)
 INSERT_SQL = (
     f"INSERT INTO jobs ({_columns}) VALUES ({_placeholders}) "
-    "ON CONFLICT (cipher) DO NOTHING"
+    "ON CONFLICT (cipher) DO UPDATE SET last_seen = NOW()"
 )
 
 _DB_FIELDS_SET = set(DB_FIELDS)

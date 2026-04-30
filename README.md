@@ -6,7 +6,7 @@ Long-running Docker service that continuously fetches public Upwork job listings
 
 ```
 src/
-├── auth/token_manager.py              # Fetch + cache visitor_gql_token
+├── auth/token_manager.py              # Fetch + cache visitor_gql_token (25 min TTL, 3 retries with proxy rotation)
 ├── controllers/scraper_controller.py  # Main loop, signal handling, retry/backoff
 ├── errors/base_errors.py              # TokenExpired, TokenFetchFailed
 ├── log/log_config.py                  # init_logger() with MaxLevelFilter
@@ -15,19 +15,29 @@ src/
 │   └── proxy_models.py                # ProxyConfig with to_curl_cffi_dict()
 ├── postgres/
 │   ├── core.py                        # ConnectionPool (psycopg3), get_connection()
-│   └── jobs.py                        # insert_jobs(), get_job_count()
-├── proxies/proxy_manager.py           # WebshareProxyManager — loads and rotates proxies
-├── scrapers/job_fetcher.py            # GraphQL query + pagination
+│   └── jobs.py                        # insert_jobs(), get_job_count(), has_jobs()
+├── proxies/proxy_manager.py           # WebshareProxyManager — loads, rotates, auto-refreshes hourly
+├── scrapers/job_fetcher.py            # GraphQL query, concurrent pagination (10 workers)
 └── settings/config.py                 # All env vars
 ```
 
 ## How It Works
 
-1. `curl_cffi` hits `https://www.upwork.com/` with `impersonate="chrome"` through a Webshare proxy and extracts the `visitor_gql_token` cookie
-2. That cookie is used as a Bearer token against Upwork's GraphQL API (`/api/graphql/v1`)
-3. Results are paginated (default: 3 pages × 50 jobs = 150 jobs per cycle) using a `ThreadPoolExecutor` for concurrent page fetches
-4. Jobs are inserted into PostgreSQL with `ON CONFLICT (cipher) DO NOTHING` for deduplication
-5. The scraper sleeps `SCRAPE_INTERVAL` seconds then repeats
+1. On startup, the proxy list is downloaded from Webshare and the Postgres connection pool is opened
+2. If the database is empty, a **bulk scrape** runs first — fetching up to 1000 pages (Upwork's API caps pagination at offset ~5000, so ~100 pages is the practical limit)
+3. For every subsequent cycle, `MAX_PAGES` pages are fetched (default: 3 pages × 50 jobs = 150 jobs)
+4. Pages are fetched concurrently using a `ThreadPoolExecutor` with 10 workers, each using a randomly selected proxy
+5. The token fetch also rotates proxies on each retry — if one proxy IP is blocked by Cloudflare, the next attempt uses a different one
+6. Jobs are inserted into PostgreSQL with `ON CONFLICT (cipher) DO NOTHING` for deduplication
+7. The scraper sleeps `SCRAPE_INTERVAL` seconds then repeats
+
+## Token Lifecycle
+
+- `curl_cffi` hits `https://www.upwork.com/` with `impersonate="chrome"` through a Webshare proxy
+- Upwork sets a `visitor_gql_token` cookie which is used as a Bearer token for all GraphQL API calls
+- The token is cached for 25 minutes and reused across cycles
+- On 401 responses the token is invalidated and re-fetched immediately
+- After 3 consecutive token expiry failures the scraper backs off for 5 minutes
 
 ## Environment Variables
 
@@ -41,27 +51,46 @@ src/
 
 ## Setup
 
-### 1. Configure environment
+### 1. Get a Webshare proxy URL
+
+Create an account at [webshare.io](https://webshare.io) and copy your proxy list download URL from the dashboard. It looks like:
+
+```
+https://proxy.webshare.io/api/v2/proxy/list/download/YOUR-TOKEN/
+```
+
+The free tier (10 proxies) is enough to get started. If you see repeated 403 errors, the proxy IPs may be flagged by Cloudflare — upgrading to a paid plan with more IPs reduces this risk.
+
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your values — `POSTGRES_PASSWORD`, `DATABASE_URL`, and `WEBSHARE_URL` are all required.
+Edit `.env`:
 
-### 2. Start the database
+```env
+POSTGRES_PASSWORD=your_password
+DATABASE_URL=postgresql://upwork:your_password@localhost:5432/upwork
+WEBSHARE_URL=https://proxy.webshare.io/api/v2/proxy/list/download/YOUR-TOKEN/
+```
+
+### 3. Start the database
 
 ```bash
 docker compose up -d db
 ```
 
-### 3. Run the migration
+### 4. Run the migration
+
+Only needed once per migration. Run them in order:
 
 ```bash
 docker compose exec -T db psql -U upwork -d upwork < resources/db/migrations/001_create_jobs_table.sql
+docker compose exec -T db psql -U upwork -d upwork < resources/db/migrations/002_add_last_seen.sql
 ```
 
-### 4. Start the scraper
+### 5. Start the scraper
 
 ```bash
 docker compose up -d scraper
@@ -101,6 +130,9 @@ docker compose exec db psql -U upwork -d upwork -c "SELECT COUNT(*) FROM jobs;"
 # Jobs by type
 docker compose exec db psql -U upwork -d upwork -c "SELECT job_type, COUNT(*) FROM jobs GROUP BY job_type ORDER BY count DESC;"
 
+# Jobs by contractor tier
+docker compose exec db psql -U upwork -d upwork -c "SELECT contractor_tier, COUNT(*) FROM jobs GROUP BY contractor_tier ORDER BY count DESC;"
+
 # Most recently scraped jobs
 docker compose exec db psql -U upwork -d upwork -c "SELECT title, job_type, published_date FROM jobs ORDER BY scraped_at DESC LIMIT 20;"
 
@@ -114,14 +146,14 @@ docker compose exec db psql -U upwork -d upwork -c "\COPY (SELECT * FROM jobs) T
 ### Control
 
 ```bash
-# Stop everything
+# Stop everything (data is preserved in the pgdata volume)
 docker compose down
 
 # Stop and wipe the database volume (destructive — deletes all data)
 docker compose down -v
 
-# Restart just the scraper (e.g. after a config change)
-docker compose restart scraper
+# Restart just the scraper (e.g. after changing .env)
+docker compose up -d
 
 # Rebuild the scraper image (e.g. after a code change) then restart
 docker compose build scraper && docker compose up -d scraper
@@ -129,7 +161,7 @@ docker compose build scraper && docker compose up -d scraper
 
 ## Ports
 
-The Postgres container is exposed on **host port 5432**. To connect from a local client (DBeaver, psql, etc.):
+The Postgres container is exposed on **host port 5432**. To connect from a local client (DBeaver, psql, TablePlus, etc.):
 
 ```
 Host:     localhost
@@ -141,36 +173,67 @@ Password: <POSTGRES_PASSWORD from .env>
 
 ## Database Schema
 
-Jobs are deduplicated on `cipher` (Upwork's unique job ID). Key columns:
+Jobs are deduplicated on `cipher` (Upwork's unique job ID). The schema lives in [`resources/db/migrations/001_create_jobs_table.sql`](resources/db/migrations/001_create_jobs_table.sql).
 
-| Column           | Type        | Description |
-|------------------|-------------|-------------|
-| `cipher`         | TEXT UNIQUE | Deduplication key — Upwork's job ID |
-| `title`          | TEXT        | Job title |
-| `description`    | TEXT        | Full job description |
-| `link`           | TEXT        | URL to the job posting |
-| `skills`         | TEXT[]      | Required skills (array) |
-| `published_date` | TIMESTAMPTZ | When the job was posted on Upwork |
-| `job_type`       | TEXT        | `hourly` or `fixed` |
-| `is_hourly`      | BOOLEAN     | Hourly flag |
-| `hourly_low`     | INTEGER     | Minimum hourly rate |
-| `hourly_high`    | INTEGER     | Maximum hourly rate |
-| `budget`         | INTEGER     | Fixed price budget |
-| `duration_weeks` | INTEGER     | Expected project duration in weeks |
-| `contractor_tier`| TEXT        | Experience level required |
-| `scraped_at`     | TIMESTAMPTZ | When this row was inserted |
+| Column            | Type        | Description |
+|-------------------|-------------|-------------|
+| `id`              | SERIAL PK   | Auto-increment row ID |
+| `cipher`          | TEXT UNIQUE | Deduplication key — Upwork's unique job ID |
+| `title`           | TEXT        | Job title |
+| `description`     | TEXT        | Full job description |
+| `link`            | TEXT        | URL to the job posting |
+| `skills`          | TEXT[]      | Required skills (array) |
+| `published_date`  | TIMESTAMPTZ | When the job was posted on Upwork |
+| `job_type`        | TEXT        | `hourly` or `fixed` |
+| `is_hourly`       | BOOLEAN     | Hourly flag |
+| `hourly_low`      | INTEGER     | Minimum hourly rate |
+| `hourly_high`     | INTEGER     | Maximum hourly rate |
+| `budget`          | INTEGER     | Fixed price budget |
+| `duration_weeks`  | INTEGER     | Expected project timeline in weeks |
+| `contractor_tier` | TEXT        | Experience level required |
+| `scraped_at`      | TIMESTAMPTZ | When this row was first inserted (default: now) |
+| `last_seen`       | TIMESTAMPTZ | When this job was most recently seen in a scrape cycle |
 
-Full schema: [`resources/db/migrations/001_create_jobs_table.sql`](resources/db/migrations/001_create_jobs_table.sql)
+Indexes: `published_date DESC`, `scraped_at DESC`, `last_seen DESC`.
+
+`scraped_at` is set once on insert and never changes. `last_seen` is updated to `NOW()` every time the same job is seen again, so `last_seen - scraped_at` tells you how long a job has been on the market.
+
+## Data Persistence
+
+All data lives in a Docker named volume (`pgdata`). It survives `docker compose down`, container rebuilds, and host reboots. The only way to delete it is `docker compose down -v`.
 
 ## Proxies
 
-A proxy is randomly selected from the Webshare list for each token fetch and API call. The same proxy is used for both — the token is tied to the egress IP. The proxy list is refreshed automatically every hour.
+- The proxy list is downloaded from Webshare at startup and refreshed automatically every hour
+- Each concurrent page fetch uses a randomly selected proxy from the list
+- Token fetch retries also rotate proxies — if one IP is blocked by Cloudflare, the next retry picks a different one
+- **402 from proxy**: Webshare quota exhausted — wait for monthly reset or upgrade plan
+- **403 from Upwork**: Proxy IP flagged by Cloudflare — with enough proxies in the pool, retries will succeed
+
+## Error Handling & Backoff
+
+| Error | Behaviour |
+|-------|-----------|
+| Token fetch fails (403, network error) | Retry up to 3 times with different proxies, then back off 5 min |
+| Token expired mid-cycle (401) | Invalidate and re-fetch immediately; back off 5 min after 3 consecutive expiries |
+| Individual page fetch fails | Log warning, skip that page, continue with remaining pages |
+| Any other exception | Log error, back off 30 seconds |
 
 ## Key Design Choices
 
 - **`curl_cffi` for everything** — Chrome TLS fingerprint matching bypasses Cloudflare for both the token fetch and API calls. No browser needed.
-- **`visitor_gql_token` over `UniversalSearchNuxt_vt`** — The main Upwork page returns the token directly in cookies, bypassing the search page which has extra CF protection.
-- **Same proxy for token + API** — The token is tied to the egress IP, so the proxy that fetches it must also be used for subsequent API calls.
+- **`visitor_gql_token` over `UniversalSearchNuxt_vt`** — The main Upwork page sets the token directly in cookies, avoiding the search page which has heavier CF protection.
+- **Per-retry proxy rotation on token fetch** — Each of the 3 token fetch attempts picks a fresh random proxy, so a single blocked IP doesn't exhaust all retries.
+- **Bulk scrape on first run** — On an empty database the scraper fetches everything reachable (~100 pages) before switching to incremental cycles.
 - **psycopg3 with ConnectionPool** — Lazy init, opened and closed by the controller.
 - **Raw SQL, no ORM** — Direct psycopg3 with parameterized queries.
-- **`ON CONFLICT (cipher) DO NOTHING`** — Silent deduplication on Upwork's job cipher.
+- **`ON CONFLICT (cipher) DO NOTHING`** — Silent deduplication; re-scraping the same jobs is harmless.
+
+## Stack
+
+- Python 3.13
+- `curl_cffi` (Chrome TLS impersonation)
+- `psycopg[binary,pool]` 3.2+
+- `pydantic` 2+
+- PostgreSQL 17
+- Docker + Docker Compose
