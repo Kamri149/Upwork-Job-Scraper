@@ -51,12 +51,12 @@ src/
 
 ## Setup
 
-This scraper does not manage its own database. It connects to the shared PostgreSQL instance defined in [`../infra`](../infra).
+This scraper does not manage its own database. It connects to the shared PostgreSQL instance defined in [`../infra/job-scraper-db`](../infra/job-scraper-db).
 
 ### 1. Start the shared database
 
 ```bash
-cd ../infra
+cd ../infra/job-scraper-db
 docker compose up -d db
 ```
 
@@ -169,7 +169,7 @@ Host:     localhost
 Port:     5432
 Database: job_scraper
 User:     job_scraper
-Password: <POSTGRES_PASSWORD from infra/.env>
+Password: <POSTGRES_PASSWORD from infra/job-scraper-db/.env>
 ```
 
 ## Database Schema
